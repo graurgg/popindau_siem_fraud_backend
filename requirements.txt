@@ -5,3 +5,4 @@ kafka-python==2.0.2
 tensorflow==2.20.0
 python-dotenv==1.0.0
 pydantic==2.4.2
+sseclient==0.0.25
