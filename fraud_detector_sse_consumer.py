@@ -5,16 +5,14 @@ import json
 import requests
 import urllib3
 from kafka import KafkaConsumer
-from fastapi import FastAPI
 
-app = FastAPI()
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-transactions = []
 
 # --- CONFIGURARE API ---
-API_KEY = "YOUR_API_KEY" # Schimba aici
+API_KEY = "726b8811029a43be71d7c997f21a983ff24b524c5d94cfdfa60f0efbeeaa4322"
+STREAM_URL = "https://95.217.75.14:8443/stream"
 FLAG_URL = "https://95.217.75.14:8443/api/flag"
 headers = {"X-API-Key": API_KEY}
 
@@ -42,11 +40,20 @@ consumer = KafkaConsumer(
     value_deserializer=lambda x: json.loads(x.decode('utf-8'))
 )
 
+LOCAL_API_URL = 'http://localhost:8000/api/v1/processed-transaction' 
+
+def send_to_local_api(data):
+    """Trimite rezultatul procesarii catre Backend-ul Uvicorn (pentru vizualizare)."""
+    try:
+        # Folosim calea /api/v1/processed-transaction
+        requests.post(LOCAL_API_URL, json=data, verify=False, timeout=2)
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not send processed data to local API: {e}")
+
 def run_detector_and_flag():
     print(f"--- 🧠 Detectorul de Frauda citeste din Kafka topic '{KAFKA_TOPIC}' ---")
     
     for message in consumer:
-        transactions.append(message.value)
         transaction = message.value
         
         # Extrage campurile necesare
@@ -71,11 +78,6 @@ def run_detector_and_flag():
         
         print(f"[TRZ {trans_num}] Decizie: {flag_status} (Amt: ${amount}) | API Status: {result.get('success', False)}")
         print("-" * 50)
-    
-@app.get("/transactions")
-def get_transactions():
-    """Returneaza toate tranzactiile procesate."""
-    return transactions
     
 if __name__ == "__main__":
     run_detector_and_flag()

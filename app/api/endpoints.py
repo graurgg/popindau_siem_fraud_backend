@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from datetime import datetime
+from typing import List, Dict
 import uuid
 
 router = APIRouter()
@@ -53,6 +54,27 @@ async def create_transaction(transaction_data: dict):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    
+@router.post("/processed-transaction")
+async def receive_processed_transaction(data: dict):
+    """
+    Acest endpoint este apelat de fraud_detector_sse_consumer.py 
+    pentru a stoca tranzactiile procesate (cu is_fraud, confidence, etc.).
+    """
+    try:
+        global transactions_store
+        data['processed_at'] = datetime.now()
+        # Stocarea in memoria locala (pentru demo)
+        transactions_store.append(data)
+        
+        # Poti limita dimensiunea listei pentru a nu umple memoria
+        
+        if len(transactions_store) > 5000:
+             transactions_store = transactions_store[-5000:]
+             
+        return {"status": "success", "message": "Transaction stored"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage error: {str(e)}")
 
 @router.get("/transactions")
 async def get_transactions(limit: int = 50):
