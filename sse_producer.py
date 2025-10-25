@@ -1,11 +1,10 @@
 # popindau_siem_fraud_backend/sse_producer.py
 
-# Install: pip install sseclient-py requests kafka-python
 import json
 import requests
 import urllib3
 from sseclient import SSEClient
-from kafka import KafkaProducer
+from confluent_kafka import Producer
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -19,42 +18,59 @@ headers = {"X-API-Key": API_KEY}
 KAFKA_SERVER = 'localhost:9092'
 KAFKA_TOPIC = 'transactions'
 
-producer = KafkaProducer(
-    bootstrap_servers=[KAFKA_SERVER],
-    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-    max_block_ms=30000 
-)
+producer_conf = {
+    'bootstrap.servers': KAFKA_SERVER,
+    'client.id': 'sse-producer'
+}
+
+producer = Producer(producer_conf)
+
+
+def delivery_report(err, msg):
+    """Callback after each message delivery."""
+    if err is not None:
+        print(f"❌ Eroare la trimiterea mesajului: {err}")
+    else:
+        print(f"✅ Tranzactie publicata in Kafka: {msg.topic()} [{msg.partition()}] offset {msg.offset()}")
+
 
 def run_sse_to_kafka_producer():
     """Citeste din SSE Stream si publica mesajele in Kafka."""
-    if not producer.bootstrap_connected():
-        print("Eroare: Nu ma pot conecta la Kafka Broker.")
-        return
-
     print("--- Conectare la SSE Stream si publicare in Kafka... ---")
+
     try:
         response = requests.get(STREAM_URL, headers=headers, stream=True, verify=False)
         client = SSEClient(response)
 
         for event in client.events():
-            if event.data:
-                try:
-                    transaction = json.loads(event.data)
-                    
-                    # Trimite tranzactia bruta catre topic-ul 'transactions'
-                    producer.send(KAFKA_TOPIC, value=transaction)
-                    producer.flush() # Asigura ca mesajul e trimis imediat
-                    
-                    trans_num = transaction.get('trans_num', 'N/A')
-                    print(f"✅ Publicat tranzactia {trans_num} in Kafka.")
-                    
-                except json.JSONDecodeError:
-                    print(f"Eroare la decodare JSON: {event.data}")
-            
+            if not event.data:
+                continue
+
+            try:
+                transaction = json.loads(event.data)
+
+                # Trimite tranzactia catre Kafka
+                producer.produce(
+                    topic=KAFKA_TOPIC,
+                    value=json.dumps(transaction).encode('utf-8'),
+                    callback=delivery_report
+                )
+
+                producer.poll(0)  # run delivery callbacks
+                trans_num = transaction.get('trans_num', 'N/A')
+                print(f"📤 Publicat tranzactia {trans_num} in Kafka.")
+
+            except json.JSONDecodeError:
+                print(f"⚠️ Eroare la decodare JSON: {event.data}")
+
     except Exception as e:
         print(f"\n⛔ Eroare majora in SSE Producer: {e}")
+
     finally:
-        producer.close()
+        print("🧹 Golesc bufferul Kafka...")
+        producer.flush()
+        print("✅ Producer oprit corect.")
+
 
 if __name__ == "__main__":
     run_sse_to_kafka_producer()
