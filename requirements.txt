@@ -1,5 +1,5 @@
 fastapi==0.104.1
-uvicorn==0.24.0
+uvicorn[standard]==0.24.0
 pymongo==4.5.0
 kafka-python==2.0.2
 tensorflow==2.20.0
