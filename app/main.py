@@ -3,6 +3,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
+
+from app.database import get_async_database, test_async_connection, close_async_connection
+
+from datetime import datetime
 import os
 import asyncio
 import json
@@ -61,29 +65,61 @@ async def shutdown_db_client():
     print("✅ MongoDB connection closed")
 
 @app.get("/sse/transactions")
-async def sse_transactions(request: Request):
+async def sse_transactions(
+    request: Request, 
+    recent: bool = True,  # Send recent transactions on connect
+    stats_interval: int = 30  # Send stats every N seconds
+):
     async def event_generator():
         try:
+            db = get_async_database()
+            if db is None:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Database connection failed'})}\n\n"
+                return
+            
             # Send initial connection message
             yield f"data: {json.dumps({'type': 'connected', 'message': 'SSE connection established'})}\n\n"
             
-            # Send a test transaction immediately
-            yield f"data: {json.dumps({'type': 'new_transaction', 'data': {'trans_num': 'TEST-001', 'amount': '50.00', 'status': 'LEGITIM'}})}\n\n"
+            # Send recent transactions if requested
+            if recent:
+                recent_transactions = await get_recent_transactions(db, limit=20)
+                for tx in recent_transactions:
+                    yield f"data: {json.dumps({'type': 'recent_transaction', 'data': tx})}\n\n"
             
-            # Keep connection alive and send periodic test data
-            count = 0
+            # Set up real-time monitoring
+            last_timestamp = datetime.utcnow()
+            last_stats_sent = datetime.utcnow()
+            
             while True:
                 if await request.is_disconnected():
                     break
-                    
-                count += 1
-                # Send a test transaction every 10 seconds
-                yield f"data: {json.dumps({'type': 'new_transaction', 'data': {'trans_num': f'TX-{count}', 'amount': str(round(count * 10.5, 2)), 'status': 'LEGITIM', 'timestamp': time.time()}})}\n\n"
                 
-                await asyncio.sleep(10)  # Send every 10 seconds
+                current_time = datetime.utcnow()
+                
+                # Check for new transactions
+                new_transactions = await get_new_transactions(db, last_timestamp)
+                for tx in new_transactions:
+                    yield f"data: {json.dumps({'type': 'new_transaction', 'data': tx})}\n\n"
+                    # Update last timestamp
+                    if 'timestamp' in tx:
+                        last_timestamp = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00'))
+                
+                # Send statistics periodically
+                if (current_time - last_stats_sent).total_seconds() >= stats_interval:
+                    stats = await get_live_stats(db)
+                    yield f"data: {json.dumps({'type': 'stats_update', 'data': stats})}\n\n"
+                    last_stats_sent = current_time
+                
+                # Send heartbeat if no activity
+                if len(new_transactions) == 0:
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': current_time.isoformat()})}\n\n"
+                
+                await asyncio.sleep(1)  # Check every second
                 
         except asyncio.CancelledError:
             print("SSE connection closed by client")
+        except Exception as e:
+            print(f"SSE error: {e}")
     
     return StreamingResponse(
         event_generator(),
@@ -92,9 +128,76 @@ async def sse_transactions(request: Request):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers": "*",
         }
     )
+
+async def get_recent_transactions(db, limit: int = 20):
+    """Get recent transactions for initial load"""
+    try:
+        cursor = db.transactions.find().sort("timestamp", -1).limit(limit)
+        transactions = []
+        async for doc in cursor:
+            # Convert for JSON serialization
+            doc = convert_doc_for_json(doc)
+            transactions.append(doc)
+        return transactions
+    except Exception as e:
+        print(f"Error getting recent transactions: {e}")
+        return []
+
+async def get_new_transactions(db, since: datetime):
+    """Get transactions newer than the given timestamp"""
+    try:
+        query = {"timestamp": {"$gt": since}}
+        cursor = db.transactions.find(query).sort("timestamp", 1)
+        transactions = []
+        async for doc in cursor:
+            transactions.append(convert_doc_for_json(doc))
+        return transactions
+    except Exception as e:
+        print(f"Error getting new transactions: {e}")
+        return []
+
+async def get_live_stats(db):
+    """Get current statistics"""
+    try:
+        total = await db.transactions.count_documents({})
+        fraud_count = await db.transactions.count_documents({"fraud_detection.is_fraud": True})
+        
+        # Last hour transactions
+        one_hour_ago = datetime.utcnow().timestamp() - 3600
+        hourly_count = await db.transactions.count_documents({
+            "timestamp": {"$gte": datetime.fromtimestamp(one_hour_ago)}
+        })
+        
+        return {
+            "total_transactions": total,
+            "fraud_transactions": fraud_count,
+            "fraud_percentage": (fraud_count / total * 100) if total > 0 else 0,
+            "transactions_last_hour": hourly_count,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        print(f"Error getting stats: {e}")
+        return {}
+
+def convert_doc_for_json(doc):
+    """Convert MongoDB document for JSON serialization"""
+    if "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    
+    # Convert datetime fields to ISO format
+    datetime_fields = ["timestamp", "created_at", "updated_at"]
+    for field in datetime_fields:
+        if field in doc and doc[field]:
+            doc[field] = doc[field].isoformat()
+    
+    # Convert fraud detection timestamps
+    if "fraud_detection" in doc and doc["fraud_detection"]:
+        if "processed_at" in doc["fraud_detection"] and doc["fraud_detection"]["processed_at"]:
+            doc["fraud_detection"]["processed_at"] = doc["fraud_detection"]["processed_at"].isoformat()
+    
+    return doc
 
 @app.get("/")
 async def root():

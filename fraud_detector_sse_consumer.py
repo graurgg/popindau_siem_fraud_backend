@@ -13,35 +13,39 @@ import time
 from confluent_kafka import Consumer, KafkaError, KafkaException
 import tensorflow as tf
 import pandas as pd
-import requests  # ← ADD THIS
-import urllib3  # ← ADD THIS
+import requests
+import urllib3
 import numpy as np
 import joblib
 from datetime import datetime
 
 from pymongo import MongoClient
 import urllib.parse
-from dotenv import load_dotenv  # ← ADD THIS
+from dotenv import load_dotenv
 
-# Add MongoDB configuration after other configurations
-
-load_dotenv()  # ← ADD THIS
+load_dotenv()
 
 # --- Kafka Configuration ---
 KAFKA_SERVER = "localhost:9092"
 KAFKA_TOPIC = "transactions"
 CONSUMER_GROUP = "fraud-detector-group"
 
-# Add your existing functions below...
-# Load your model and preprocessing objects (do this once at startup)
-MODEL_PATH = "./models/final_model.h5"  # Update with your actual model path
-SCALER_PATH = "./models/scaler.pkl"  # Update with your scaler path
-LABEL_ENCODERS_PATH = "./models/label_encoders.pkl"  # Update with your encoders path
+# Model paths - updated to include both models
+MODEL_PATH_KERAS = "./models/final_model.keras"
+MODEL_PATH_H5 = "./models/final_model.h5"  # Add your H5 model path
+SCALER_PATH = "./models/scaler.pkl"
+LABEL_ENCODERS_PATH = "./models/label_encoders.pkl"
 
-# Global variables for model and preprocessing objects
-fraud_model = None
+# Global variables for models and preprocessing objects
+fraud_model_keras = None
+fraud_model_h5 = None
 scaler = None
 label_encoders = None
+
+# Ensemble configuration
+ENSEMBLE_WEIGHT_KERAS = 0.8  # Weight for Keras model prediction
+ENSEMBLE_WEIGHT_H5 = 0.2     # Weight for H5 model prediction
+FRAUD_THRESHOLD = 0.9        # Combined threshold for fraud detection
 
 def store_transaction_in_mongodb(transaction_data, fraud_result):
     """Store transaction and fraud detection result in MongoDB with authentication"""
@@ -49,7 +53,6 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
         from pymongo import MongoClient
         from pymongo.errors import OperationFailure
         
-        # Use the same connection string as in your .env file
         MONGODB_URL = os.getenv("MONGODB_URL")
         
         if not MONGODB_URL:
@@ -59,19 +62,15 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
         client = MongoClient(
             MONGODB_URL,
             serverSelectionTimeoutMS=5000,
-            # Add authentication parameters explicitly
             authSource='admin',
-            username='admin',  # Explicitly set username
-            password='password'  # Explicitly set password
+            username='admin',
+            password='password'
         )
         
-        # Get the database name from the connection string or use default
         db_name = "fraud_detection"
         db = client[db_name]
         
-        # Test authentication first with explicit command
         try:
-            # Use the admin database for authentication test
             admin_db = client.admin
             admin_db.command('ping')
             print("✅ MongoDB authentication successful")
@@ -86,7 +85,7 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
             client.close()
             return False
         
-        # Prepare document
+        # Enhanced document with ensemble results
         doc = {
             'transaction_id': transaction_data.get('transaction_id'),
             'trans_num': trans_num,
@@ -99,8 +98,11 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
             'fraud_detection': {
                 'is_fraud': bool(fraud_result['fraud_flag']),
                 'fraud_probability': fraud_result['fraud_probability'],
+                'keras_probability': fraud_result.get('keras_probability', 0),
+                'h5_probability': fraud_result.get('h5_probability', 0),
                 'confidence': fraud_result['confidence'],
                 'model_version': fraud_result['model_version'],
+                'ensemble_used': fraud_result.get('ensemble_used', False),
                 'processed_at': datetime.now()
             },
             'raw_data': transaction_data,
@@ -108,10 +110,8 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
             'updated_at': datetime.now()
         }
         
-        # Use the transactions collection with explicit authentication
         collection = db.transactions
         
-        # Upsert to ensure we don't duplicate
         result = collection.update_one(
             {'trans_num': trans_num},
             {'$set': doc},
@@ -120,14 +120,16 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
         
         print(f"💾 MongoDB update result: matched={result.matched_count}, modified={result.modified_count}, upserted_id={result.upserted_id}")
         
-        # Also store in fraud_flags if it's fraud
         if fraud_result['fraud_flag']:
             fraud_flag_doc = {
                 'trans_num': trans_num,
                 'flag_value': 1,
                 'fraud_probability': fraud_result['fraud_probability'],
+                'keras_probability': fraud_result.get('keras_probability', 0),
+                'h5_probability': fraud_result.get('h5_probability', 0),
                 'confidence': fraud_result['confidence'],
                 'model_version': fraud_result['model_version'],
+                'ensemble_used': fraud_result.get('ensemble_used', False),
                 'flagged_at': datetime.now()
             }
             db.fraud_flags.insert_one(fraud_flag_doc)
@@ -147,14 +149,23 @@ def store_transaction_in_mongodb(transaction_data, fraud_result):
         return False
 
 def load_fraud_detection_components():
-    """Load the trained model, scaler, and label encoders"""
-    global fraud_model, scaler, label_encoders
+    """Load both trained models, scaler, and label encoders"""
+    global fraud_model_keras, fraud_model_h5, scaler, label_encoders
     
     try:
-        fraud_model = tf.keras.models.load_model(MODEL_PATH)
+        # Load Keras model
+        fraud_model_keras = tf.keras.models.load_model(MODEL_PATH_KERAS)
+        print("✅ Keras fraud detection model loaded successfully")
+        
+        # Load H5 model
+        fraud_model_h5 = tf.keras.models.load_model(MODEL_PATH_H5)
+        print("✅ H5 fraud detection model loaded successfully")
+        
+        # Load preprocessing components
         scaler = joblib.load(SCALER_PATH)
         label_encoders = joblib.load(LABEL_ENCODERS_PATH)
-        print("✅ Fraud detection model and preprocessing components loaded successfully")
+        print("✅ Preprocessing components loaded successfully")
+        
         return True
     except Exception as e:
         print(f"❌ Error loading fraud detection components: {e}")
@@ -201,18 +212,16 @@ def preprocess_transaction_for_model(transaction):
         
         for col in categorical_columns:
             if col in df.columns and col in label_encoders:
-                # Handle unseen categories by using the most common class (0)
                 try:
                     df[col] = label_encoders[col].transform(df[col].astype(str))
                 except ValueError:
-                    # If category wasn't seen during training, use default value
                     df[col] = 0
         
         # Ensure all columns are numeric
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Fill any NaN values with 0 (or use appropriate strategy)
+        # Fill any NaN values with 0
         df = df.fillna(0)
         
         # Apply the same scaling used during training
@@ -224,13 +233,30 @@ def preprocess_transaction_for_model(transaction):
         print(f"❌ Error preprocessing transaction: {e}")
         return None
 
-def predict_fraud(transaction):
-    """Use the trained model to predict if a transaction is fraudulent"""
-    global fraud_model
+def predict_with_single_model(model, features, model_name=""):
+    """Make prediction with a single model"""
+    try:
+        prediction = model.predict(features, verbose=0)
+        probability = float(prediction[0][0])
+        print(f"   📊 {model_name} model probability: {probability:.4f}")
+        return probability
+    except Exception as e:
+        print(f"❌ Error predicting with {model_name} model: {e}")
+        return 0.0
+
+def ensemble_predict(keras_prob, h5_prob):
+    """Combine predictions from both models using weighted average"""
+    combined_prob = (keras_prob * ENSEMBLE_WEIGHT_KERAS + 
+                    h5_prob * ENSEMBLE_WEIGHT_H5)
+    return combined_prob
+
+def predict_fraud_ensemble(transaction):
+    """Use both models to predict if a transaction is fraudulent"""
+    global fraud_model_keras, fraud_model_h5
     
-    if fraud_model is None:
-        print("❌ Model not loaded")
-        return 0, 0.0  # Default to not fraud
+    if fraud_model_keras is None or fraud_model_h5 is None:
+        print("❌ One or both models not loaded")
+        return 0, 0.0, 0.0, 0.0
     
     try:
         # Preprocess the transaction
@@ -238,21 +264,56 @@ def predict_fraud(transaction):
         
         if features is None:
             print("⚠️ Could not preprocess transaction, using fallback")
-            return 0, 0.0
+            return 0, 0.0, 0.0, 0.0
         
-        # Make prediction
-        prediction = fraud_model.predict(features, verbose=0)
-        fraud_probability = float(prediction[0][0])
+        print("🤖 Running ensemble prediction...")
         
-        # Use threshold (adjust based on your model's performance)
-        FRAUD_THRESHOLD = 0.16
-        is_fraud = 1 if fraud_probability > FRAUD_THRESHOLD else 0
+        # Get predictions from both models
+        keras_probability = predict_with_single_model(fraud_model_keras, features, "Keras")
+        h5_probability = predict_with_single_model(fraud_model_h5, features, "H5")
         
-        return is_fraud, fraud_probability
+        # Combine predictions using ensemble
+        combined_probability = ensemble_predict(keras_probability, h5_probability)
+        
+        # Use threshold for final decision
+        is_fraud = 1 if combined_probability > FRAUD_THRESHOLD else 0
+        
+        print(f"   🎯 Combined probability: {combined_probability:.4f} (Threshold: {FRAUD_THRESHOLD})")
+        print(f"   🚩 Final decision: {'FRAUD' if is_fraud else 'LEGITIMATE'}")
+        
+        return is_fraud, combined_probability, keras_probability, h5_probability
         
     except Exception as e:
-        print(f"❌ Prediction error: {e}")
-        return 0, 0.0
+        print(f"❌ Ensemble prediction error: {e}")
+        return 0, 0.0, 0.0, 0.0
+
+def fallback_predict_fraud(transaction):
+    """Fallback prediction if ensemble fails - use either available model"""
+    global fraud_model_keras, fraud_model_h5
+    
+    try:
+        features = preprocess_transaction_for_model(transaction)
+        if features is None:
+            return 0, 0.0, 0.0, 0.0
+        
+        # Try Keras model first
+        if fraud_model_keras is not None:
+            probability = predict_with_single_model(fraud_model_keras, features, "Keras (fallback)")
+            is_fraud = 1 if probability > FRAUD_THRESHOLD else 0
+            return is_fraud, probability, probability, 0.0
+        
+        # Try H5 model if Keras not available
+        elif fraud_model_h5 is not None:
+            probability = predict_with_single_model(fraud_model_h5, features, "H5 (fallback)")
+            is_fraud = 1 if probability > FRAUD_THRESHOLD else 0
+            return is_fraud, probability, 0.0, probability
+        
+        else:
+            return 0, 0.0, 0.0, 0.0
+            
+    except Exception as e:
+        print(f"❌ Fallback prediction error: {e}")
+        return 0, 0.0, 0.0, 0.0
 
 def flag_transaction(trans_num, is_fraud):
     """Send fraud flag to API"""
@@ -265,7 +326,7 @@ def flag_transaction(trans_num, is_fraud):
         
         payload = {
             "trans_num": trans_num,
-            "flag_value": is_fraud  # This will be 0 or 1 as required
+            "flag_value": is_fraud
         }
         
         print(f"🚩 Sending flag {is_fraud} for transaction {trans_num} to API...")
@@ -289,7 +350,6 @@ def flag_transaction(trans_num, is_fraud):
 def send_to_local_api(data):
     """Send data to local API"""
     try:
-        # This is a placeholder - replace with your actual API call
         print(f"📤 Sending to API: {data}")
         return {"success": True}
     except Exception as e:
@@ -318,17 +378,18 @@ def run_detector_and_flag():
         print(f"❌ Eroare la crearea consumer-ului: {e}")
         return
 
-    print(f"--- 🧠 Detectorul de Frauda cu AI Model asculta topicul '{KAFKA_TOPIC}' ---")
+    print(f"--- 🧠🤖 Detectorul de Frauda cu ENSEMBLE AI Models asculta topicul '{KAFKA_TOPIC}' ---")
+    print(f"⚖️  Ensemble weights: Keras={ENSEMBLE_WEIGHT_KERAS}, H5={ENSEMBLE_WEIGHT_H5}")
+    print(f"🎯 Fraud threshold: {FRAUD_THRESHOLD}")
     print("⏳ Astept mesaje Kafka...")
 
     message_count = 0
 
     try:
         while True:
-            msg = consumer.poll(1.0)  # asteapta 1 secunda
+            msg = consumer.poll(1.0)
             
             if msg is None:
-                # No message received
                 if message_count == 0:
                     print("⏳ Nu s-au primit mesaje inca... (poll timeout)")
                 continue
@@ -344,7 +405,6 @@ def run_detector_and_flag():
                     raise KafkaException(msg.error())
 
             try:
-                print(f"📦 Raw message: {msg.value()}")
                 transaction = json.loads(msg.value().decode('utf-8'))
                 print(f"🔍 Tranzactie parsata: {transaction}")
             except json.JSONDecodeError as e:
@@ -359,37 +419,46 @@ def run_detector_and_flag():
 
             print(f"🎯 Procesare tranzactie {trans_num} cu suma ${amount}")
 
-            # --- AI MODEL PREDICTION ---
-            is_fraud, fraud_probability = predict_fraud(transaction)
+            # --- ENSEMBLE AI MODEL PREDICTION ---
+            is_fraud, fraud_probability, keras_prob, h5_prob = predict_fraud_ensemble(transaction)
+            
+            # If ensemble failed, try fallback
+            if fraud_probability == 0.0 and (fraud_model_keras is not None or fraud_model_h5 is not None):
+                print("🔄 Attempting fallback prediction...")
+                is_fraud, fraud_probability, keras_prob, h5_prob = fallback_predict_fraud(transaction)
             
             flag_status = "FRAUDA" if is_fraud else "Legitima"
             confidence_level = "HIGH" if fraud_probability > 0.8 else "MEDIUM" if fraud_probability > 0.5 else "LOW"
 
-            print(f"🤖 Rezultat model: {flag_status} (probabilitate: {fraud_probability:.4f})")
+            print(f"🤖 Rezultat ensemble: {flag_status} (probabilitate combinata: {fraud_probability:.4f})")
 
             result = flag_transaction(trans_num, is_fraud)
-            send_to_local_api({
+            
+            # Enhanced data for API and MongoDB
+            enhanced_data = {
                 "trans_num": trans_num,
                 "amount": amount,
                 "fraud_flag": is_fraud,
                 "fraud_probability": fraud_probability,
+                "keras_probability": keras_prob,
+                "h5_probability": h5_prob,
                 "confidence": confidence_level,
-                "model_version": "ai_v1"
-            })
+                "model_version": "ensemble_v1",
+                "ensemble_used": True
+            }
+            
+            send_to_local_api(enhanced_data)
 
-            mongodb_result = store_transaction_in_mongodb(transaction, {
-                "fraud_flag": is_fraud,
-                "fraud_probability": fraud_probability,
-                "confidence": confidence_level,
-                "model_version": "ai_v1"
-            })
+            mongodb_result = store_transaction_in_mongodb(transaction, enhanced_data)
 
             if mongodb_result:
                 print(f"💾 Stored in MongoDB: {trans_num}")
             else:
                 print(f"⚠️  Failed to store in MongoDB: {trans_num}")
 
-            print(f"📊 [TRZ {trans_num}] → {flag_status} (Amt: ${amount:.2f}, Prob: {fraud_probability:.4f}, Conf: {confidence_level}) | API: {result.get('success', False)}")
+            print(f"📊 [TRZ {trans_num}] → {flag_status} (Amt: ${amount:.2f})")
+            print(f"   📈 Probabilities - Combined: {fraud_probability:.4f}, Keras: {keras_prob:.4f}, H5: {h5_prob:.4f}")
+            print(f"   🎯 Confidence: {confidence_level} | API Success: {result.get('success', False)}")
             print("-" * 80)
 
     except KeyboardInterrupt:
@@ -402,47 +471,9 @@ def run_detector_and_flag():
         consumer.close()
         print(f"✅ Consumer inchis corect. Total mesaje procesate: {message_count}")
 
-# Alternative simpler version if you want to test quickly
-def run_detector_simple():
-    """Simplified version for testing"""
-    if not load_fraud_detection_components():
-        return
-
-    # Test with your example transaction
-    example_transaction = {
-        "transaction_id": "181e5ed4-0f35-4785-896e-11c9c487a491",
-        "ssn": "670-97-4056", 
-        "cc_num": "4745171339596292335",
-        "first": "Robert",
-        "last": "Hudson",
-        "gender": "M",
-        "street": "825 Roberts Grove Apt. 260",
-        "city": "Hampton",
-        "state": "GA",
-        "zip": "30228",
-        "lat": "33.4124",
-        "long": "-84.2947",
-        "city_pop": "38569",
-        "job": "Health and safety inspector",
-        "dob": "1980-01-01",
-        "acct_num": "720983479468",
-        "trans_num": "616ceb5d75c429c47be5b271af8af2ba",
-        "trans_date": "2025-10-22",
-        "trans_time": "09:54:29",
-        "unix_time": "1761116069",
-        "category": "grocery_net",
-        "amt": "75.18",
-        "merchant": "fraud_Wiegand-Lowe",
-        "merch_lat": "33.928527",
-        "merch_long": "-83.908964"
-    }
-    
-    is_fraud, probability = predict_fraud(example_transaction)
-    print(f"Example transaction - Fraud: {is_fraud}, Probability: {probability:.4f}")
-
-def test_fraud_detection():
-    """Test the fraud detection without Kafka"""
-    print("🧪 Testare sistem de detectie frauda...")
+def test_ensemble_detection():
+    """Test the ensemble fraud detection without Kafka"""
+    print("🧪🤖 Testare sistem ENSEMBLE de detectie frauda...")
     
     if not load_fraud_detection_components():
         print("❌ Componente incarcate cu esec")
@@ -485,16 +516,33 @@ def test_fraud_detection():
         print("❌ Preprocesare esuata")
         return
     
-    print("🤖 Testare predictie...")
-    is_fraud, probability = predict_fraud(test_transaction)
-    print(f"✅ Rezultat: Fraud={is_fraud}, Probability={probability:.4f}")
+    global ENSEMBLE_WEIGHT_KERAS, ENSEMBLE_WEIGHT_H5
+    print("🤖 Testare predictie ensemble...")
+    is_fraud, combined_prob, keras_prob, h5_prob = predict_fraud_ensemble(test_transaction)
+    print(f"✅ Rezultat ensemble:")
+    print(f"   - Fraud: {is_fraud}")
+    print(f"   - Combined Probability: {combined_prob:.4f}")
+    print(f"   - Keras Model Probability: {keras_prob:.4f}")
+    print(f"   - H5 Model Probability: {h5_prob:.4f}")
+    print(f"   - Ensemble Weights: Keras({ENSEMBLE_WEIGHT_KERAS}), H5({ENSEMBLE_WEIGHT_H5})")
+
+def adjust_ensemble_weights_based_on_performance():
+    """Function to dynamically adjust ensemble weights based on model performance"""
+    # This could be enhanced to track model performance over time
+    # and adjust weights accordingly
+    global ENSEMBLE_WEIGHT_KERAS, ENSEMBLE_WEIGHT_H5
+    
+    # For now, using fixed weights as defined above
+    # In production, you could load performance metrics from MongoDB
+    # and adjust weights dynamically
+    pass
 
 if __name__ == "__main__":
-    # Test the system first
-    test_fraud_detection()
+    # Test the ensemble system first
+    test_ensemble_detection()
     
     # Then run the Kafka consumer
-    print("\n" + "="*50)
-    print("Pornire consumator Kafka...")
-    print("="*50)
+    print("\n" + "="*60)
+    print("Pornire consumator Kafka cu Ensemble Models...")
+    print("="*60)
     run_detector_and_flag()
