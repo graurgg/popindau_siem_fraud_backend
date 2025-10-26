@@ -27,7 +27,7 @@ def get_async_database():
             async_client = AsyncIOMotorClient(
                 MONGODB_URL, 
                 serverSelectionTimeoutMS=5000,
-                authSource="fraud_detection"
+                authSource="admin"
             )
             database = async_client[MONGODB_DB_NAME]
             print(f"✅ Async MongoDB client initialized for: {MONGODB_DB_NAME}")

@@ -90,6 +90,8 @@ async def create_transaction(transaction_data: dict, db=Depends(get_async_databa
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
+
+
 @router.post("/processed-transaction")
 async def receive_processed_transaction(data: dict, db=Depends(get_async_database)):
     """

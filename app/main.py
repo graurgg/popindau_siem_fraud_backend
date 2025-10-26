@@ -1,9 +1,12 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from fastapi.responses import StreamingResponse
 import os
 import asyncio
+import json
+import time
 
 # Load environment variables
 load_dotenv()
@@ -56,6 +59,42 @@ async def shutdown_db_client():
     from app.database import close_async_connection
     await close_async_connection()  # Now properly awaited
     print("✅ MongoDB connection closed")
+
+@app.get("/sse/transactions")
+async def sse_transactions(request: Request):
+    async def event_generator():
+        try:
+            # Send initial connection message
+            yield f"data: {json.dumps({'type': 'connected', 'message': 'SSE connection established'})}\n\n"
+            
+            # Send a test transaction immediately
+            yield f"data: {json.dumps({'type': 'new_transaction', 'data': {'trans_num': 'TEST-001', 'amount': '50.00', 'status': 'LEGITIM'}})}\n\n"
+            
+            # Keep connection alive and send periodic test data
+            count = 0
+            while True:
+                if await request.is_disconnected():
+                    break
+                    
+                count += 1
+                # Send a test transaction every 10 seconds
+                yield f"data: {json.dumps({'type': 'new_transaction', 'data': {'trans_num': f'TX-{count}', 'amount': str(round(count * 10.5, 2)), 'status': 'LEGITIM', 'timestamp': time.time()}})}\n\n"
+                
+                await asyncio.sleep(10)  # Send every 10 seconds
+                
+        except asyncio.CancelledError:
+            print("SSE connection closed by client")
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "*",
+        }
+    )
 
 @app.get("/")
 async def root():
